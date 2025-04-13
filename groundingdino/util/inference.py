@@ -13,17 +13,78 @@ from groundingdino.models import build_model
 from groundingdino.util.misc import clean_state_dict
 from groundingdino.util.slconfig import SLConfig
 from groundingdino.util.utils import get_phrases_from_posmap
+from openai import OpenAI
+from typing import Optional
+
+import uuid
+import base64
+from GroundingDINO.config import settings
 
 # ----------------------------------------------------------------------------------------------------------------------
 # OLD API
 # ----------------------------------------------------------------------------------------------------------------------
 
 
-def preprocess_caption(caption: str) -> str:
-    result = caption.lower().strip()
-    if result.endswith("."):
-        return result
-    return result + "."
+# def preprocess_caption(caption: str) -> str:
+#     result = caption.lower().strip()
+#     if result.endswith("."):
+#         return result
+#     return result + "."
+
+client = OpenAI(api_key=settings.OPENAI_API_KEY, base_url=settings.OPENAI_API_BASE_URL)
+
+def preprocess_caption(
+    caption: str,
+    language: Optional[str] = "en",  # 目标语言（默认为英语）
+    extract_keywords: bool = True,    # 是否提取关键词
+    # openai_api_key: str = "YOUR_API_KEY"
+) -> str:
+    """
+    使用大模型增强的文本预处理：
+    1. 翻译为目标语言
+    2. 提取关键信息
+    3. 标准化文本格式
+    """
+    # 初始化 OpenAI 客户端
+    # openai.api_key = openai_api_key
+
+    # 构造大模型指令
+    system_prompt = f"""
+    You are a text preprocessing assistant. Perform the following steps:
+    1. Translate the input to {language} if not already in {language}.
+    2. { "Extract key noun phrases, remove adjectives/adverbs if possible." if extract_keywords else "" }
+    3. Format as lowercase without ending punctuation.
+    4. Correct any spelling/grammar errors.
+    Output ONLY the final result.
+    """
+    
+    # # 调用大模型
+    # response = openai.ChatCompletion.create(
+    #     model="gpt-3.5-turbo",
+    #     messages=[
+    #         {"role": "system", "content": system_prompt},
+    #         {"role": "user", "content": caption}
+    #     ],
+    #     temperature=0.1  # 低随机性确保稳定性
+    # )
+
+    response = client.chat.completions.create(
+        model=settings.OPENAI_MODEL_NAME,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": caption},
+        ],
+        temperature=0.1,  # 低随机性确保稳定性
+        stream=False
+    )
+    
+    processed_text = response.choices[0].message.content.strip()
+    
+    # 确保以句号结尾（适配原检测模型）
+    if not processed_text.endswith("."):
+        processed_text += "."
+    
+    return processed_text.lower()
 
 
 def load_model(model_config_path: str, model_checkpoint_path: str, device: str = "cuda"):
@@ -97,6 +158,38 @@ def predict(
     return boxes, logits.max(dim=1)[0], phrases
 
 
+# def annotate(image_source: np.ndarray, boxes: torch.Tensor, logits: torch.Tensor, phrases: List[str]) -> np.ndarray:
+#     """    
+#     This function annotates an image with bounding boxes and labels.
+
+#     Parameters:
+#     image_source (np.ndarray): The source image to be annotated.
+#     boxes (torch.Tensor): A tensor containing bounding box coordinates.
+#     logits (torch.Tensor): A tensor containing confidence scores for each bounding box.
+#     phrases (List[str]): A list of labels for each bounding box.
+
+#     Returns:
+#     np.ndarray: The annotated image.
+#     """
+#     h, w, _ = image_source.shape
+#     boxes = boxes * torch.Tensor([w, h, w, h])
+#     xyxy = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
+#     detections = sv.Detections(xyxy=xyxy)
+
+#     labels = [
+#         f"{phrase} {logit:.2f}"
+#         for phrase, logit
+#         in zip(phrases, logits)
+#     ]
+
+#     bbox_annotator = sv.BoxAnnotator(color_lookup=sv.ColorLookup.INDEX)
+#     label_annotator = sv.LabelAnnotator(color_lookup=sv.ColorLookup.INDEX)
+#     annotated_frame = cv2.cvtColor(image_source, cv2.COLOR_RGB2BGR)
+#     annotated_frame = bbox_annotator.annotate(scene=annotated_frame, detections=detections)
+#     annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
+#     return annotated_frame
+
+# 转化为label studio格式
 def annotate(image_source: np.ndarray, boxes: torch.Tensor, logits: torch.Tensor, phrases: List[str]) -> np.ndarray:
     """    
     This function annotates an image with bounding boxes and labels.
@@ -111,23 +204,58 @@ def annotate(image_source: np.ndarray, boxes: torch.Tensor, logits: torch.Tensor
     np.ndarray: The annotated image.
     """
     h, w, _ = image_source.shape
-    boxes = boxes * torch.Tensor([w, h, w, h])
-    xyxy = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
-    detections = sv.Detections(xyxy=xyxy)
+    # 转换坐标到绝对像素值
+    if boxes.numel() > 0:
+        pixel_boxes = boxes * torch.Tensor([w, h, w, h]).to(boxes.device)
+        xyxy = box_convert(boxes=pixel_boxes, in_fmt="cxcywh", out_fmt="xyxy").cpu().numpy()
+    else:
+        xyxy = np.empty((0, 4))
 
-    labels = [
-        f"{phrase} {logit:.2f}"
-        for phrase, logit
-        in zip(phrases, logits)
-    ]
+    # 构建Label Studio标注结构
+    annotations = []
+    for bbox, score, phrase in zip(xyxy, logits, phrases):
+        x1, y1, x2, y2 = bbox
+        
+        # 转换为百分比坐标
+        x_percent = x1 / w * 100
+        y_percent = y1 / h * 100
+        width_percent = (x2 - x1) / w * 100
+        height_percent = (y2 - y1) / h * 100
 
-    bbox_annotator = sv.BoxAnnotator(color_lookup=sv.ColorLookup.INDEX)
-    label_annotator = sv.LabelAnnotator(color_lookup=sv.ColorLookup.INDEX)
-    annotated_frame = cv2.cvtColor(image_source, cv2.COLOR_RGB2BGR)
-    annotated_frame = bbox_annotator.annotate(scene=annotated_frame, detections=detections)
-    annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
-    return annotated_frame
+        annotations.append({
+            "id": str(uuid.uuid4()),
+            "type": "rectanglelabels",
+            "value": {
+                "x": x_percent,
+                "y": y_percent,
+                "width": width_percent,
+                "height": height_percent,
+                "rotation": 0,
+                "rectanglelabels": [phrase]
+            },
+            "score": float(score),
+            "from_name": "label",
+            "to_name": "image"
+        })
 
+    # 构建完整任务结构
+    task = {
+        "data": {
+            "image": f"data:image/jpeg;base64,{image_to_base64(image_source)}"
+        },
+        "predictions": [{
+            "model_version": "grounding-dino",
+            "score": float(logits.mean().item()) if len(logits) > 0 else 0.0,
+            "result": annotations
+        }]
+    }
+    
+    return task
+
+def image_to_base64(image_array: np.ndarray) -> str:
+    """将OpenCV图像转为Base64字符串"""
+    _, buffer = cv2.imencode('.jpg', image_array)
+    return base64.b64encode(buffer).decode('utf-8')
 
 # ----------------------------------------------------------------------------------------------------------------------
 # NEW API
